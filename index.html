@@ -1,0 +1,657 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Users, Play, Trophy, Settings, LogOut, ShieldCheck, Gamepad2, UserPlus, Zap, Clock, Calculator, Menu, ArrowLeft, X } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, updateDoc, onSnapshot, serverTimestamp, getDoc } from 'firebase/firestore';
+
+// --- Firebase Initialization ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'math-game-v1';
+
+// --- Helpers ---
+const generateProblem = (difficulty = 1) => {
+    const ops = ['+', '-', '*'];
+    const op = ops[Math.floor(Math.random() * ops.length)];
+    let a, b, answer;
+    if (op === '+') {
+        a = Math.floor(Math.random() * (10 * difficulty)) + 1;
+        b = Math.floor(Math.random() * (10 * difficulty)) + 1;
+        answer = a + b;
+    } else if (op === '-') {
+        a = Math.floor(Math.random() * (10 * difficulty)) + 5;
+        b = Math.floor(Math.random() * a); 
+        answer = a - b;
+    } else { 
+        a = Math.floor(Math.random() * (5 * difficulty)) + 1;
+        b = Math.floor(Math.random() * (5 * difficulty)) + 1;
+        answer = a * b;
+    }
+    return { question: `${a} ${op} ${b}`, answer };
+};
+
+// --- Styles & Animation ---
+const styles = `
+    @import url('https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;600;800&display=swap');
+    
+    .font-prompt { font-family: 'Prompt', sans-serif; }
+    
+    .glass-panel {
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.5);
+    }
+    .animate-pop {
+        animation: pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+    @keyframes pop {
+        0% { transform: scale(0.5); opacity: 0; }
+        100% { transform: scale(1); opacity: 1; }
+    }
+    .no-zoom { touch-action: manipulation; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+`;
+
+export default function App() {
+    const [user, setUser] = useState(null); 
+    const [appUser, setAppUser] = useState(null); 
+    const [view, setView] = useState('login'); 
+    const [loading, setLoading] = useState(true);
+    const [notification, setNotification] = useState(null);
+    const [players, setPlayers] = useState({});
+    const [leaderboard, setLeaderboard] = useState([]);
+
+    // --- Auth Effect ---
+    useEffect(() => {
+        const initAuth = async () => {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        };
+        initAuth();
+        const unsubscribe = onAuthStateChanged(auth, setUser);
+        return () => unsubscribe();
+    }, []);
+
+    // --- Data Effect ---
+    useEffect(() => {
+        if (!user) return;
+        
+        const playersRef = collection(db, 'artifacts', appId, 'public', 'data', 'players');
+        const unsubscribe = onSnapshot(playersRef, (snapshot) => {
+            const playersData = {};
+            const lbData = [];
+            snapshot.forEach(doc => {
+                const d = doc.data();
+                playersData[doc.id] = d;
+                lbData.push({ username: doc.id, ...d });
+            });
+            lbData.sort((a, b) => (b.highScore || 0) - (a.highScore || 0));
+            setPlayers(playersData);
+            setLeaderboard(lbData);
+            setLoading(false);
+        }, (error) => {
+            console.error("Firestore Error:", error);
+            setLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, [user]);
+
+    const showNotify = (msg, type='info') => {
+        setNotification({ msg, type });
+        setTimeout(() => setNotification(null), 3000);
+    };
+
+    const handleLogin = (username, password) => {
+        if (username === 'admin' && password === 'admin1234') {
+            setAppUser({ username: 'admin', role: 'admin', displayName: 'ผู้ดูแลระบบ' });
+            setView('menu');
+            return;
+        }
+        const player = players[username];
+        if (player && player.password === password) {
+            setAppUser({ ...player, username });
+            setView('menu');
+        } else {
+            showNotify("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง", "error");
+        }
+    };
+
+    const handleCreateUser = async (newUsername, newPassword, displayName) => {
+        if (!user) return;
+        if (players[newUsername]) {
+            showNotify("ชื่อผู้ใช้นี้มีอยู่แล้ว", "error");
+            return;
+        }
+        try {
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'players', newUsername), {
+                password: newPassword,
+                displayName: displayName,
+                highScore: 0,
+                gamesPlayed: 0,
+                createdAt: new Date().toISOString()
+            });
+            showNotify(`สร้างผู้ใช้สำเร็จ!`, "success");
+        } catch (e) {
+            showNotify("เกิดข้อผิดพลาด", "error");
+            console.error(e);
+        }
+    };
+
+    const updateScore = async (score) => {
+        if (!appUser || appUser.role === 'admin') return;
+        const currentHighScore = appUser.highScore || 0;
+        const updates = { gamesPlayed: (appUser.gamesPlayed || 0) + 1, lastPlayed: new Date().toISOString() };
+        
+        // Optimistic Update
+        if (score > currentHighScore) {
+            updates.highScore = score;
+            setAppUser(prev => ({ ...prev, ...updates }));
+            showNotify(`สถิติใหม่! ${score} คะแนน`, "success");
+        }
+        
+        try {
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'players', appUser.username), updates);
+        } catch (e) { console.error(e); }
+    };
+
+    if (loading) return <div className="h-screen flex items-center justify-center text-white text-xl font-bold animate-pulse font-prompt">กำลังเชื่อมต่อ...</div>;
+
+    return (
+        <div className="min-h-screen w-full flex flex-col items-center p-3 relative bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-600 font-prompt overflow-hidden fixed inset-0">
+            <style>{styles}</style>
+            
+            {/* Notification */}
+            {notification && (
+                <div className={`fixed top-4 left-4 right-4 md:left-1/2 md:right-auto md:-translate-x-1/2 px-4 py-3 rounded-xl shadow-2xl z-50 text-white font-bold text-center animate-pop ${notification.type === 'error' ? 'bg-red-500' : 'bg-emerald-500'}`}>
+                    {notification.msg}
+                </div>
+            )}
+
+            {/* Header */}
+            <header className="w-full max-w-lg flex justify-between items-center mb-4 z-10 shrink-0">
+                <div className="flex items-center gap-2 text-white">
+                    <div className="bg-white/20 p-2 rounded-lg"><Calculator size={24} /></div>
+                    <h1 className="text-xl font-bold">Math Speed</h1>
+                </div>
+                {appUser && (
+                    <div className="flex items-center gap-2">
+                        <span className="text-sm font-semibold text-white bg-white/20 px-3 py-1.5 rounded-full backdrop-blur-sm max-w-[120px] truncate">
+                            {appUser.displayName}
+                        </span>
+                        <button onClick={() => { setAppUser(null); setView('login'); }} className="p-2 bg-white/10 hover:bg-white/20 text-white rounded-full transition no-zoom">
+                            <LogOut size={18}/>
+                        </button>
+                    </div>
+                )}
+            </header>
+
+            <main className="w-full max-w-lg flex-1 flex flex-col relative z-0 pb-6 overflow-hidden">
+                {view === 'login' && <LoginView onLogin={handleLogin} />}
+                
+                {view === 'menu' && (
+                    <div className="grid grid-cols-1 gap-4 animate-pop overflow-y-auto pb-4 no-scrollbar">
+                        <MenuCard 
+                            icon={<Zap size={40} />} 
+                            color="bg-amber-400" 
+                            title="เล่นคนเดียว" 
+                            desc="ฝึกฝนทำลายสถิติ" 
+                            onClick={() => setView('singleplayer')} 
+                        />
+                        <MenuCard 
+                            icon={<Gamepad2 size={40} />} 
+                            color="bg-pink-500" 
+                            title="แข่งกับเพื่อน" 
+                            desc="Real-time 1 vs 1" 
+                            onClick={() => setView('lobby')} 
+                        />
+                         <div className="grid grid-cols-2 gap-4">
+                            <MenuCardSmall 
+                                icon={<Trophy size={24} />} 
+                                color="bg-blue-500" 
+                                title="อันดับ" 
+                                onClick={() => setView('leaderboard')} 
+                            />
+                            {appUser?.role === 'admin' && (
+                                <MenuCardSmall 
+                                    icon={<ShieldCheck size={24} />} 
+                                    color="bg-slate-700" 
+                                    title="แอดมิน" 
+                                    onClick={() => setView('admin')} 
+                                />
+                            )}
+                         </div>
+                    </div>
+                )}
+
+                {view === 'singleplayer' && <SinglePlayerGame onEnd={(s) => { updateScore(s); setView('menu'); }} onBack={() => setView('menu')} />}
+                {view === 'lobby' && <MultiplayerLobby user={user} appUser={appUser} db={db} appId={appId} onBack={() => setView('menu')} showNotify={showNotify}/>}
+                {view === 'leaderboard' && <LeaderboardView data={leaderboard} onBack={() => setView('menu')} />}
+                {view === 'admin' && <AdminView onCreate={handleCreateUser} onBack={() => setView('menu')} />}
+            </main>
+        </div>
+    );
+}
+
+// --- Sub-Components ---
+
+function MenuCard({ icon, color, title, desc, onClick }) {
+    return (
+        <div onClick={onClick} className="glass-panel p-6 rounded-2xl flex items-center gap-6 active:scale-95 transition no-zoom cursor-pointer shadow-lg hover:bg-white/90">
+            <div className={`${color} p-4 rounded-2xl text-white shadow-md`}>{icon}</div>
+            <div>
+                <h2 className="text-2xl font-bold text-indigo-900">{title}</h2>
+                <p className="text-slate-600 text-sm">{desc}</p>
+            </div>
+        </div>
+    );
+}
+
+function MenuCardSmall({ icon, color, title, onClick }) {
+    return (
+        <div onClick={onClick} className="glass-panel p-4 rounded-2xl flex flex-col items-center justify-center gap-2 active:scale-95 transition no-zoom cursor-pointer shadow-lg hover:bg-white/90">
+            <div className={`${color} p-3 rounded-full text-white shadow-md`}>{icon}</div>
+            <h2 className="text-lg font-bold text-indigo-900">{title}</h2>
+        </div>
+    );
+}
+
+function LoginView({ onLogin }) {
+    const [u, setU] = useState('');
+    const [p, setP] = useState('');
+
+    return (
+        <div className="glass-panel p-6 rounded-3xl shadow-2xl flex-1 flex flex-col justify-center animate-pop overflow-y-auto">
+            <div className="text-center mb-8 shrink-0">
+                <div className="inline-block p-4 bg-indigo-100 rounded-full text-indigo-600 mb-4">
+                    <Calculator size={48} />
+                </div>
+                <h2 className="text-3xl font-bold text-indigo-900">เข้าสู่ระบบ</h2>
+                <p className="text-slate-500">กรุณาเข้าสู่ระบบเพื่อเริ่มเล่น</p>
+            </div>
+            <form onSubmit={(e)=>{e.preventDefault(); if(u&&p) onLogin(u,p);}} className="space-y-4 shrink-0">
+                <input type="text" value={u} onChange={e=>setU(e.target.value)} className="w-full p-4 rounded-xl bg-slate-50 border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none text-lg" placeholder="ชื่อผู้ใช้ (Username)" />
+                <input type="password" value={p} onChange={e=>setP(e.target.value)} className="w-full p-4 rounded-xl bg-slate-50 border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none text-lg" placeholder="รหัสผ่าน (Password)" />
+                <button type="submit" className="w-full bg-indigo-600 text-white font-bold py-4 rounded-xl shadow-lg active:scale-95 transition text-lg no-zoom mt-4">
+                    เข้าเล่นเกม
+                </button>
+            </form>
+            <div className="mt-8 text-center text-xs text-slate-400 bg-slate-100 p-3 rounded-lg shrink-0">
+                * ติดต่อแอดมิน/ครู เพื่อขอรับ User/Password
+            </div>
+        </div>
+    );
+}
+
+function SinglePlayerGame({ onEnd, onBack }) {
+    const [gameState, setGameState] = useState('ready');
+    const [score, setScore] = useState(0);
+    const [timeLeft, setTimeLeft] = useState(60);
+    const [problem, setProblem] = useState({ question: '', answer: 0 });
+    const [input, setInput] = useState('');
+    const inputRef = useRef(null);
+
+    useEffect(() => {
+        if (gameState === 'playing') {
+            setProblem(generateProblem(1));
+            const timer = setInterval(() => {
+                setTimeLeft(p => {
+                    if (p <= 1) { clearInterval(timer); setGameState('finished'); return 0; }
+                    return p - 1;
+                });
+            }, 1000);
+            return () => clearInterval(timer);
+        }
+    }, [gameState]);
+
+    useEffect(() => {
+        if(gameState === 'playing' && inputRef.current) inputRef.current.focus();
+    }, [problem, gameState]);
+
+    const handleAnswer = (e) => {
+        e.preventDefault();
+        if(!input) return;
+        const val = parseInt(input);
+        if (val === problem.answer) {
+            setScore(s => s + 10 + Math.floor(s/100));
+            setInput('');
+            setProblem(generateProblem(score > 100 ? 2 : 1));
+        } else {
+            setInput(''); 
+        }
+    };
+
+    return (
+        <div className="glass-panel p-4 rounded-3xl shadow-2xl flex-1 flex flex-col items-center justify-center relative overflow-hidden">
+            {gameState === 'ready' && (
+                <div className="text-center w-full animate-pop">
+                    <h2 className="text-4xl font-black text-indigo-900 mb-2">พร้อมลุย?</h2>
+                    <p className="text-slate-600 mb-8 text-lg">มีเวลา 60 วินาที</p>
+                    <div className="flex flex-col gap-3 w-full max-w-xs mx-auto">
+                        <button onClick={() => setGameState('playing')} className="w-full bg-indigo-600 text-white py-4 rounded-xl text-xl font-bold shadow-lg active:scale-95 transition no-zoom">เริ่มเลย!</button>
+                        <button onClick={onBack} className="w-full bg-slate-200 text-slate-700 py-3 rounded-xl font-bold active:scale-95 transition no-zoom">กลับ</button>
+                    </div>
+                </div>
+            )}
+
+            {gameState === 'playing' && (
+                <div className="w-full max-w-sm flex flex-col h-full justify-between py-4">
+                    <div className="flex justify-between items-center mb-4 shrink-0">
+                        <div className="flex items-center gap-1 text-pink-600 font-bold bg-pink-50 px-3 py-1 rounded-lg border border-pink-100">
+                            <Clock size={18} /> {timeLeft}s
+                        </div>
+                        <div className="text-indigo-600 font-bold bg-indigo-50 px-3 py-1 rounded-lg border border-indigo-100">
+                            {score} คะแนน
+                        </div>
+                    </div>
+                    
+                    <div className="flex-1 flex items-center justify-center">
+                        <h3 className="text-7xl font-black text-slate-800 tracking-wider drop-shadow-sm">{problem.question}</h3>
+                    </div>
+
+                    <form onSubmit={handleAnswer} className="w-full shrink-0">
+                        <input 
+                            ref={inputRef}
+                            type="number" 
+                            inputMode="numeric" 
+                            pattern="[0-9]*"
+                            value={input} 
+                            onChange={(e) => setInput(e.target.value)} 
+                            className="w-full text-center text-5xl font-bold p-4 rounded-2xl border-4 border-indigo-200 focus:border-indigo-500 outline-none transition bg-white/80 shadow-inner"
+                            placeholder="?"
+                            autoFocus
+                        />
+                         <button type="submit" className="hidden">Submit</button>
+                    </form>
+                </div>
+            )}
+
+            {gameState === 'finished' && (
+                <div className="text-center w-full animate-pop">
+                    <h2 className="text-3xl font-bold text-slate-800 mb-2">หมดเวลา!</h2>
+                    <div className="text-8xl font-black text-indigo-600 mb-8 drop-shadow-md">{score}</div>
+                    <button onClick={() => onEnd(score)} className="w-full bg-emerald-500 text-white font-bold py-4 rounded-xl shadow-lg active:scale-95 transition text-lg no-zoom">
+                        บันทึกคะแนน
+                    </button>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function MultiplayerLobby({ user, appUser, db, appId, onBack, showNotify }) {
+    const [roomCode, setRoomCode] = useState('');
+    const [status, setStatus] = useState('menu');
+    const [roomData, setRoomData] = useState(null);
+    const [myScore, setMyScore] = useState(0);
+    const [input, setInput] = useState('');
+    const [problem, setProblem] = useState({ question: '', answer: 0 });
+    const inputRef = useRef(null);
+    const [timeLeft, setTimeLeft] = useState(60);
+    const [roomRef, setRoomRef] = useState(null); // Just storing doc ref path or object if needed, but better to use state for listener
+
+    // We use a useEffect to listen to the room when roomCode and status match
+    useEffect(() => {
+        if (status === 'menu' || !roomCode) return;
+        
+        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
+        
+        const unsubscribe = onSnapshot(ref, (docSnap) => {
+            if(!docSnap.exists()) return;
+            const data = docSnap.data();
+            setRoomData(data);
+
+            // Host starts game logic
+            if (data.status === 'ready' && status === 'waiting') {
+                // Check if I am host
+                if (appUser.displayName === data.host) {
+                    // Give a small delay then start
+                    setTimeout(() => {
+                         updateDoc(ref, { status: 'playing', endTime: Date.now() + 61000 });
+                    }, 1000);
+                }
+            }
+
+            if (data.status === 'playing' && status !== 'playing') {
+                setStatus('playing');
+                setProblem(generateProblem());
+                
+                // Sync Timer Logic
+                const end = data.endTime;
+                const interval = setInterval(() => {
+                    const remaining = Math.max(0, Math.ceil((end - Date.now()) / 1000));
+                    setTimeLeft(remaining);
+                    if (remaining <= 0) {
+                        clearInterval(interval);
+                        setStatus('finished');
+                    }
+                }, 1000);
+                // Note: This interval might duplicate if re-rendered, usually use a separate useEffect for timer, but for simple logic this works if status stable
+            }
+        });
+        return () => unsubscribe();
+    }, [roomCode, status, db, appId, appUser]);
+
+
+    const createRoom = async () => {
+        const code = Math.floor(1000 + Math.random() * 9000).toString();
+        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', code);
+        
+        try {
+            await setDoc(ref, {
+                host: appUser.displayName,
+                guest: null,
+                hostScore: 0,
+                guestScore: 0,
+                status: 'waiting',
+                createdAt: serverTimestamp()
+            });
+            setRoomCode(code);
+            setStatus('waiting');
+        } catch (e) {
+            console.error(e);
+            showNotify("สร้างห้องไม่สำเร็จ", "error");
+        }
+    };
+
+    const joinRoom = async () => {
+        if (roomCode.length !== 4) return;
+        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
+        const docSnap = await getDoc(ref);
+        
+        if (docSnap.exists() && docSnap.data().status === 'waiting') {
+            await updateDoc(ref, { guest: appUser.displayName, status: 'ready' });
+            setStatus('waiting');
+        } else {
+            showNotify("ไม่พบห้องหรือห้องเต็ม", "error");
+        }
+    };
+
+    const handleAnswer = (e) => {
+        e.preventDefault();
+        const val = parseInt(input);
+        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
+
+        if (val === problem.answer) {
+            const newScore = myScore + 10;
+            setMyScore(newScore);
+            setInput('');
+            setProblem(generateProblem(newScore > 100 ? 2 : 1));
+            
+            if (roomData && appUser.displayName === roomData.host) {
+                updateDoc(ref, { hostScore: newScore });
+            } else if (roomData) {
+                updateDoc(ref, { guestScore: newScore });
+            }
+        } else {
+            setInput('');
+        }
+    };
+
+    if (status === 'menu') {
+        return (
+            <div className="glass-panel p-6 rounded-3xl shadow-2xl flex-1 flex flex-col justify-center overflow-y-auto">
+                <h2 className="text-2xl font-bold text-center text-indigo-900 mb-6">โหมดผู้เล่นหลายคน</h2>
+                <button onClick={createRoom} className="bg-gradient-to-r from-purple-600 to-indigo-600 text-white p-5 rounded-2xl font-bold text-lg mb-6 shadow-lg active:scale-95 transition no-zoom">
+                    สร้างห้องใหม่
+                </button>
+                <div className="bg-white/50 p-6 rounded-2xl border border-white">
+                    <label className="block text-slate-600 mb-2 text-sm font-semibold text-center">เข้าร่วมห้องเพื่อน</label>
+                    <div className="flex gap-2">
+                        <input 
+                            type="text" 
+                            inputMode="numeric" 
+                            pattern="[0-9]*"
+                            maxLength="4"
+                            value={roomCode}
+                            onChange={(e) => setRoomCode(e.target.value)}
+                            className="flex-1 text-center text-2xl font-bold tracking-widest p-3 rounded-xl border-2 border-indigo-100 focus:border-indigo-500 outline-none"
+                            placeholder="0000"
+                        />
+                        <button onClick={joinRoom} disabled={roomCode.length !== 4} className="bg-indigo-600 disabled:bg-slate-300 text-white px-6 rounded-xl font-bold transition no-zoom">
+                            เข้า
+                        </button>
+                    </div>
+                </div>
+                <button onClick={onBack} className="mt-8 text-slate-500 py-3 rounded-xl hover:bg-slate-100 transition no-zoom">กลับเมนูหลัก</button>
+            </div>
+        );
+    }
+
+    if (status === 'waiting') {
+        return (
+            <div className="glass-panel p-6 rounded-3xl shadow-2xl flex-1 flex flex-col items-center justify-center overflow-y-auto">
+                <p className="text-slate-500 mb-2">รหัสห้องของคุณ</p>
+                <div className="text-6xl font-black text-indigo-600 mb-8 tracking-widest bg-white/50 px-8 py-4 rounded-2xl border-2 border-dashed border-indigo-300">{roomCode}</div>
+                
+                <div className="w-full space-y-3 mb-8">
+                    <div className="flex justify-between items-center bg-white/70 p-4 rounded-xl">
+                        <span className="font-bold text-indigo-800 flex items-center gap-2"><div className="w-2 h-2 bg-green-500 rounded-full"></div> Host</span>
+                        <span className="font-bold">{roomData?.host}</span>
+                    </div>
+                    <div className="flex justify-between items-center bg-white/70 p-4 rounded-xl">
+                        <span className="font-bold text-indigo-800 flex items-center gap-2"><div className={`w-2 h-2 rounded-full ${roomData?.guest?'bg-green-500':'bg-slate-300'}`}></div> Guest</span>
+                        <span className={`${roomData?.guest ? 'text-slate-800 font-bold' : 'text-slate-400 italic'}`}>{roomData?.guest || 'รอเพื่อน...'}</span>
+                    </div>
+                </div>
+                
+                <button onClick={onBack} className="text-red-500 font-bold py-3 px-6 rounded-xl bg-red-50 hover:bg-red-100 transition no-zoom">ยกเลิก/กลับ</button>
+            </div>
+        );
+    }
+
+    if (status === 'playing') {
+        const isHost = appUser.displayName === roomData?.host;
+        const opponentScore = isHost ? roomData?.guestScore : roomData?.hostScore;
+        const opponentName = isHost ? roomData?.guest : roomData?.host;
+        
+        return (
+             <div className="glass-panel p-4 rounded-3xl shadow-2xl flex-1 flex flex-col">
+                <div className="flex justify-between items-end mb-4 bg-white/40 p-3 rounded-2xl shrink-0">
+                    <div>
+                        <div className="text-[10px] font-bold text-slate-500 uppercase">You</div>
+                        <div className="text-3xl font-black text-indigo-600 leading-none">{myScore}</div>
+                    </div>
+                    <div className="text-xl font-bold text-white bg-red-500 px-4 py-1 rounded-lg shadow-sm">{timeLeft}</div>
+                    <div className="text-right">
+                        <div className="text-[10px] font-bold text-slate-500 uppercase">{opponentName}</div>
+                        <div className="text-3xl font-black text-pink-600 leading-none">{opponentScore || 0}</div>
+                    </div>
+                </div>
+
+                <div className="flex-1 flex items-center justify-center">
+                    <h3 className="text-6xl font-black text-slate-800 tracking-wider">{problem.question}</h3>
+                </div>
+
+                <form onSubmit={handleAnswer} className="shrink-0">
+                    <input 
+                        ref={inputRef}
+                        type="number" 
+                        inputMode="numeric" 
+                        pattern="[0-9]*"
+                        value={input} 
+                        onChange={(e) => setInput(e.target.value)} 
+                        className="w-full text-center text-5xl font-bold p-4 rounded-2xl border-4 border-indigo-200 focus:border-indigo-500 outline-none transition bg-white/80"
+                        placeholder="?"
+                        autoFocus
+                    />
+                    <button type="submit" className="hidden">Submit</button>
+                </form>
+            </div>
+        )
+    }
+
+    if (status === 'finished') {
+        const isHost = appUser.displayName === roomData?.host;
+        const opponentScore = isHost ? roomData?.guestScore : roomData?.hostScore;
+        const won = myScore > (opponentScore || 0);
+        return (
+             <div className="glass-panel p-6 rounded-3xl shadow-2xl flex-1 flex flex-col items-center justify-center animate-pop overflow-y-auto">
+                <h2 className="text-4xl font-black mb-6 text-indigo-900">{won ? '🎉 ชนะแล้ว!' : (myScore === (opponentScore || 0) ? '🤝 เสมอกัน' : '😭 แพ้แล้ว')}</h2>
+                <div className="w-full grid grid-cols-2 gap-4 mb-8">
+                    <div className="bg-indigo-50 p-4 rounded-xl text-center">
+                        <div className="text-xs text-slate-500 mb-1">คะแนนคุณ</div>
+                        <div className="text-3xl font-black text-indigo-600">{myScore}</div>
+                    </div>
+                    <div className="bg-pink-50 p-4 rounded-xl text-center">
+                         <div className="text-xs text-slate-500 mb-1">คู่แข่ง</div>
+                        <div className="text-3xl font-black text-pink-600">{opponentScore || 0}</div>
+                    </div>
+                </div>
+                <button onClick={onBack} className="w-full bg-slate-800 text-white font-bold py-4 rounded-xl shadow-lg no-zoom">กลับเมนูหลัก</button>
+            </div>
+        )
+    }
+}
+
+function LeaderboardView({ data, onBack }) {
+    return (
+        <div className="glass-panel p-4 rounded-3xl shadow-2xl flex-1 flex flex-col h-full overflow-hidden">
+            <div className="flex justify-between items-center mb-4 shrink-0">
+                <h2 className="text-xl font-bold text-indigo-900 flex items-center gap-2"><Trophy size={20} className="text-yellow-500"/> อันดับสูงสุด</h2>
+                <button onClick={onBack} className="p-2 bg-slate-100 rounded-full no-zoom"><X size={18}/></button>
+            </div>
+            <div className="overflow-y-auto flex-1 space-y-2 pr-1 no-scrollbar">
+                {data.map((p, idx) => (
+                    <div key={idx} className="flex items-center justify-between p-3 rounded-xl bg-white/60 border border-white shadow-sm">
+                        <div className="flex items-center gap-3">
+                            <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${idx===0?'bg-yellow-400 text-white':(idx===1?'bg-slate-300 text-white':(idx===2?'bg-amber-600 text-white':'bg-slate-100 text-slate-500'))}`}>
+                                {idx + 1}
+                            </div>
+                            <span className="font-semibold text-slate-700 truncate max-w-[120px]">{p.displayName}</span>
+                        </div>
+                        <span className="font-bold text-indigo-600">{p.highScore || 0}</span>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+
+function AdminView({ onCreate, onBack }) {
+    const [u, setU] = useState('');
+    const [p, setP] = useState('');
+    const [n, setN] = useState('');
+
+    return (
+        <div className="glass-panel p-5 rounded-3xl shadow-2xl flex-1 flex flex-col overflow-y-auto">
+            <div className="flex justify-between items-center mb-6 shrink-0">
+                <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2"><UserPlus size={20}/> สร้างผู้ใช้</h2>
+                <button onClick={onBack} className="p-2 bg-slate-100 rounded-full no-zoom"><X size={18}/></button>
+            </div>
+            
+            <form onSubmit={(e)=>{e.preventDefault(); if(u&&p&&n) { onCreate(u,p,n); setU(''); setP(''); setN(''); }}} className="space-y-3 shrink-0">
+                <input type="text" value={n} onChange={e=>setN(e.target.value)} className="w-full p-3 rounded-xl border border-slate-300 bg-white/80" placeholder="ชื่อเล่น (Display Name)" required />
+                <input type="text" value={u} onChange={e=>setU(e.target.value)} className="w-full p-3 rounded-xl border border-slate-300 bg-white/80" placeholder="Username" required />
+                <input type="text" value={p} onChange={e=>setP(e.target.value)} className="w-full p-3 rounded-xl border border-slate-300 bg-white/80" placeholder="Password" required />
+                <button type="submit" className="w-full bg-slate-800 text-white font-bold py-3 rounded-xl mt-4 no-zoom shadow-lg">ยืนยันการสร้าง</button>
+            </form>
+        </div>
+    );
+}
